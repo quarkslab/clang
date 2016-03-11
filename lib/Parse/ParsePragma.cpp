@@ -20,6 +20,9 @@
 #include "clang/Sema/LoopHint.h"
 #include "clang/Sema/Scope.h"
 #include "llvm/ADT/StringSwitch.h"
+
+#include <sstream>
+
 using namespace clang;
 
 namespace {
@@ -156,6 +159,14 @@ struct PragmaUnrollHintHandler : public PragmaHandler {
                     Token &FirstToken) override;
 };
 
+/// \#pragma triton assert(cond)"
+struct PragmaTritonAssertHandler : public PragmaHandler {
+  PragmaTritonAssertHandler()
+    : PragmaHandler("assert") {}
+  void HandlePragma(Preprocessor &PP, PragmaIntroducerKind Introducer,
+                    Token &FirstToken) override;
+};
+
 }  // end namespace
 
 void Parser::initializePragmaHandlers() {
@@ -223,6 +234,9 @@ void Parser::initializePragmaHandlers() {
     MSSection.reset(new PragmaMSPragma("section"));
     PP.AddPragmaHandler(MSSection.get());
   }
+
+  TritonAssertHandler.reset(new PragmaTritonAssertHandler());
+  PP.AddPragmaHandler("triton", TritonAssertHandler.get());
 
   OptimizeHandler.reset(new PragmaOptimizeHandler(Actions));
   PP.AddPragmaHandler("clang", OptimizeHandler.get());
@@ -1891,6 +1905,236 @@ void PragmaOptimizeHandler::HandlePragma(Preprocessor &PP,
   }
 
   Actions.ActOnPragmaOptimize(IsOn, FirstToken.getLocation());
+}
+
+///////////////////////////////
+//
+// Triton directives
+//
+
+// name of the call inserted in place of the triton assert directive
+// It must be provided at link time
+static char const TritonAssertFuncName[] = "__triton_assert";
+
+// push the declaration of __triton_assert(char const*, ...) into the stream
+// it is added before each call
+// FIXME: when in C++ mode, add the "C" of extern "C"
+static void PushTritonAssertDecl(Preprocessor& PP, SmallVectorImpl<Token>& TokenList, Token const& FirstToken) {
+    Token FuncNameTok;
+    FuncNameTok.startToken();
+    FuncNameTok.setKind(tok::identifier);
+    FuncNameTok.setIdentifierInfo(PP.getIdentifierInfo(TritonAssertFuncName));
+
+    Token ExternTok;
+    ExternTok.startToken();
+    ExternTok.setKind(tok::kw_extern);
+
+    Token VoidTok;
+    VoidTok.startToken();
+    VoidTok.setKind(tok::kw_void);
+
+    Token CharTok;
+    CharTok.startToken();
+    CharTok.setKind(tok::kw_char);
+
+    Token ConstTok;
+    ConstTok.startToken();
+    ConstTok.setKind(tok::kw_const);
+
+    Token StarTok;
+    StarTok.startToken();
+    StarTok.setKind(tok::star);
+
+    Token CommaTok;
+    CommaTok.startToken();
+    CommaTok.setKind(tok::comma);
+
+    Token LParTok;
+    LParTok.startToken();
+    LParTok.setKind(tok::l_paren);
+
+    Token EllipsisTok;
+    EllipsisTok.startToken();
+    EllipsisTok.setKind(tok::ellipsis);
+
+    Token RParTok;
+    RParTok.startToken();
+    RParTok.setKind(tok::r_paren);
+
+    Token SemiTok;
+    SemiTok.startToken();
+    SemiTok.setKind(tok::semi);
+
+    TokenList.push_back(ExternTok);
+    TokenList.push_back(VoidTok);
+    TokenList.push_back(FuncNameTok);
+    TokenList.push_back(LParTok);
+    TokenList.push_back(CharTok);
+    TokenList.push_back(ConstTok);
+    TokenList.push_back(StarTok);
+    TokenList.push_back(CommaTok);
+    TokenList.push_back(EllipsisTok);
+    TokenList.push_back(RParTok);
+    TokenList.push_back(SemiTok);
+
+}
+
+// Handle #pragma triton assert(cond), where cond can make reference to identifiers
+// constants and address of identifiers.
+//
+// This works by inserting new tokens into the preprocessor stream, turning
+//
+// #pragma triton assert(&a != &b && b > (c - 1) || c ^ 4)
+//
+// into
+//
+// extern __triton_assert(char const* fmt, ...);
+// __triton_assert("%0 != %1 && %2 > (%3 - 1) || %3 ^ 4", &a, &b, b, c)
+//
+void PragmaTritonAssertHandler::HandlePragma(Preprocessor &PP,
+                                             PragmaIntroducerKind Introducer,
+                                             Token &FirstToken) {
+  SmallVector<Token, 32> TokenList;
+  // an identifier is either a variable name, or its address (2 tokens)
+  // so use a vector of very small token vector to represent them
+  SmallVector<SmallVector<Token, 2>, 8> IdentifierTokenList;
+  std::map<std::string, size_t> Identifiers;
+  Token Tok;
+  PP.Lex(Tok);
+
+  // first add the extern declarator for extern __triton_assert(char const* fmt, ...);
+  PushTritonAssertDecl(PP, TokenList, FirstToken);
+
+  if (Tok.isNot(tok::l_paren)) {
+    PP.Diag(Tok.getLocation(), diag::err_function_is_not_record)
+      << PP.getSpelling(Tok) ;
+    return;
+  }
+  std::ostringstream directive;
+  directive << '"';
+
+  std::tuple<Token, bool> Adressing;  // stores addressing mode
+  while(Tok.isNot(tok::eod)) {
+    // are we trying to use the & operator?
+    if(Tok.is(tok::amp)) {
+      if(std::get<1>(Adressing)) { // two times in a row? That's an error
+        PP.Diag(Tok.getLocation(), diag::err_function_is_not_record)
+          << PP.getSpelling(Tok) ;
+        return;
+      }
+      Adressing = std::make_tuple(Tok, true);
+    }
+    // trying to use an identifier -> make it a parameter
+    else if(Tok.is(tok::identifier)) {
+      std::string IdentifierValue;
+
+      // eventually add an & before the identifier, e.g.
+      // triton assert(&a != &b) => ("%0 != %1", &a, &b)
+      if(std::get<1>(Adressing)) {
+        IdentifierValue = ("&" + Tok.getIdentifierInfo()->getName()).str();
+      }
+      else
+        IdentifierValue = Tok.getIdentifierInfo()->getName();
+
+      // handle when the same placeholder is used twice, e.g.
+      // triton assert(a != 0 && a < 3) => ("%0 !=0" && %0 < 3, a)
+      auto Where = Identifiers.find(IdentifierValue);
+      if(Where == Identifiers.end()) {
+        size_t IdentifierNum = IdentifierTokenList.size();
+        directive << '%' << IdentifierNum;
+        Identifiers.emplace(IdentifierValue, IdentifierNum);
+        if(std::get<1>(Adressing)) {
+          SmallVector<Token, 2> Toks = { std::get<0>(Adressing), Tok};
+          IdentifierTokenList.emplace_back(Toks);
+        }
+        else {
+          SmallVector<Token, 2> Toks = {Tok};
+          IdentifierTokenList.emplace_back(Toks);
+        }
+      }
+      else {
+        size_t IdentifierNum = Where->second;
+        directive << '%' << IdentifierNum;
+      }
+      std::get<1>(Adressing) = false;
+    }
+
+    // other tokens are just added to the directives
+    else {
+      // & can be a bitwise operator two, so add it here if it was not used to take an address
+      if(std::get<1>(Adressing)) {
+        directive << PP.getSpelling(std::get<0>(Adressing));
+        std::get<1>(Adressing) =false;
+      }
+      directive << PP.getSpelling(Tok);
+    }
+
+    directive << ' ';
+    PP.Lex(Tok);
+  }
+  directive << '"';
+
+  // Add a call to __triton_assert by inserting new tokens to the stream
+  //
+  // 1. Create the tokens
+  Token FuncNameTok;
+  FuncNameTok.startToken();
+  FuncNameTok.setKind(tok::identifier);
+  FuncNameTok.setIdentifierInfo(PP.getIdentifierInfo(TritonAssertFuncName));
+
+  Token LParTok;
+  LParTok.startToken();
+  LParTok.setKind(tok::l_paren);
+
+  Token CommaTok;
+  CommaTok.startToken();
+  CommaTok.setKind(tok::comma);
+
+  Token RParTok;
+  RParTok.startToken();
+  RParTok.setKind(tok::r_paren);
+
+  Token SemiTok;
+  SemiTok.startToken();
+  SemiTok.setKind(tok::semi);
+
+  Token FmtTok;
+  FmtTok.startToken();
+  FmtTok.setKind(tok::string_literal);
+  auto sdirective = directive.str();
+  FmtTok.setLiteralData(strdup(sdirective.c_str()));
+  FmtTok.setLength(sdirective.size());
+
+  // 2. insert them in the token flow
+  // __triton_assert("fmt"
+  TokenList.push_back(FuncNameTok);
+  TokenList.push_back(LParTok);
+  TokenList.push_back(FmtTok);
+
+  // , id0, id1, ...
+  if(!IdentifierTokenList.empty()) {
+    for(auto const& Toks : IdentifierTokenList) {
+      TokenList.push_back(CommaTok);
+      for(auto const& Tok : Toks)
+        TokenList.push_back(Tok);
+    }
+  }
+
+  // );
+  TokenList.push_back(RParTok);
+  TokenList.push_back(SemiTok);
+
+  // lazily fix locations
+  for(Token& Tok : TokenList)
+    Tok.setLocation(FirstToken.getLocation());
+
+  // finally prepare memory, insert tokens in memory and feed the stream
+  Token *TokenArray = new Token[TokenList.size()];
+  std::copy(TokenList.begin(), TokenList.end(), TokenArray);
+
+  PP.EnterTokenStream(TokenArray, TokenList.size(),
+                      /*DisableMacroExpansion=*/false,
+                      /*OwnsTokens=*/true);
 }
 
 /// \brief Parses loop or unroll pragma hint value and fills in Info.
